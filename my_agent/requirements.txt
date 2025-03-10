@@ -1,0 +1,12 @@
+langgraph
+langgraph-sdk
+langgraph-checkpoint
+langchain-core
+langsmith
+langchain-community
+langchain-openai
+tavily-python
+python-dotenv
+pydantic
+PyGithub
+gitpython 
