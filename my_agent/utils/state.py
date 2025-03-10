@@ -4,7 +4,7 @@ State definitions for the agent.
 from langgraph.graph.message import add_messages
 from langchain_core.messages import AnyMessage
 from pydantic import BaseModel, Field
-from typing import List, Annotated
+from typing import List, Annotated, Dict, Optional
 
 class AICodeAuditState(BaseModel):
     """State for the agent workflow."""
@@ -12,6 +12,12 @@ class AICodeAuditState(BaseModel):
     # The messages passed between the agent and user
     messages: Annotated[List[AnyMessage], add_messages]
     plan: str = Field(description="Plan of the agent", default=None)
+    
+    # Error tracking
+    errors: List[Dict[str, str]] = Field(
+        description="List of errors encountered during processing",
+        default_factory=list
+    )
     
     # GitHub repository data
     repo_url: str = Field(description="URL of the GitHub repository to audit", default=None)
