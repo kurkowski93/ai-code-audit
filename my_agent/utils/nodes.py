@@ -5,7 +5,7 @@ import re
 import os
 import base64
 import requests
-from typing import Dict
+from typing import Dict, List, Optional, Any, Callable, TypeVar, Union, Tuple
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from .state import AICodeAuditState
@@ -14,11 +14,118 @@ from github.GithubException import GithubException
 from enum import Enum
 from pydantic import BaseModel, Field
 
+# Type definitions for better type checking
+StateUpdate = Dict[str, Any]
+ErrorInfo = Dict[str, str]
+T = TypeVar('T')
+
 class AgentAction(str, Enum):
+    """Possible actions that the agent can take."""
     DOWNLOAD_REPO_AND_MAKE_REPORT = "download_repo_and_make_report",
     ANSWER_QUESTION = "answer_question"
 
-def starting_node(state: AICodeAuditState) -> Dict:
+def check_repo_content(state: AICodeAuditState, perspective: str) -> Optional[StateUpdate]:
+    """
+    Check if repository content is available in the state.
+    
+    Args:
+        state: The current state
+        perspective: The name of the perspective checking the content
+        
+    Returns:
+        StateUpdate if there's an error, None if content is available
+    """
+    repo_content = state.repo_content if hasattr(state, "repo_content") and state.repo_content else ""
+    
+    if not repo_content:
+        return {
+            "errors": state.errors + [{"source": f"{perspective}_perspective", "message": "Repository content not available"}],
+            "messages": [AIMessage(content=f"Error: Repository content not available for {perspective} analysis. Please fetch the repository first.")]
+        }
+    
+    return None
+
+def call_llm_with_error_handling(
+    prompt: str, 
+    state: AICodeAuditState, 
+    source: str, 
+    success_message: str, 
+    result_field: Optional[str] = None,
+    model_name: str = "gpt-4o-mini"
+) -> StateUpdate:
+    """
+    Call a language model with error handling.
+    
+    Args:
+        prompt: The prompt to send to the model
+        state: The current state
+        source: The source of the call for error reporting
+        success_message: The message to return on success
+        result_field: The field to store the result in (if None, only messages are updated)
+        model_name: The name of the model to use
+        
+    Returns:
+        StateUpdate with the result or error information
+    """
+    try:
+        model = ChatOpenAI(model=model_name)
+        response = model.invoke(prompt)
+        
+        result = {"messages": [AIMessage(content=response.content)]}
+        if result_field:
+            result[result_field] = response.content
+        
+        return result
+    except Exception as e:
+        return {
+            "errors": state.errors + [{"source": source, "message": f"Error calling language model: {str(e)}"}],
+            "messages": [AIMessage(content=f"Error in {source}: {str(e)}")]
+        }
+
+def handle_perspective_analysis(
+    state: AICodeAuditState,
+    perspective: str,
+    prompt_template: str,
+    result_field: str,
+    success_message: str
+) -> StateUpdate:
+    """
+    Handle the analysis of a repository from a specific perspective.
+    
+    Args:
+        state: The current state
+        perspective: The name of the perspective
+        prompt_template: The template for the prompt to send to the model
+        result_field: The field to store the result in
+        success_message: The message to return on success
+        
+    Returns:
+        StateUpdate with the result or error information
+    """
+    try:
+        # Check if repository content is available
+        content_check = check_repo_content(state, perspective)
+        if content_check:
+            return content_check
+        
+        # Format the prompt with the repository content
+        prompt = prompt_template.format(repo_content=state.repo_content)
+        
+        # Call the model with error handling
+        return call_llm_with_error_handling(
+            prompt=prompt,
+            state=state,
+            source=f"{perspective}_perspective",
+            success_message=success_message,
+            result_field=result_field
+        )
+    except Exception as e:
+        return {
+            "errors": state.errors + [{"source": f"{perspective}_perspective", "message": f"Unexpected error: {str(e)}"}],
+            "messages": [AIMessage(content=f"An unexpected error occurred during {perspective} analysis: {str(e)}")]
+        }
+
+def starting_node(state: AICodeAuditState) -> StateUpdate:
     """
     Initial node that determines the next step based on the current state.
     
@@ -67,9 +174,7 @@ def starting_node(state: AICodeAuditState) -> Dict:
         }
 
 
-    
-
-def call_model(state: AICodeAuditState) -> Dict:
+def call_model(state: AICodeAuditState) -> StateUpdate:
     """
     Call the LLM with the current messages.
     
@@ -81,7 +186,6 @@ def call_model(state: AICodeAuditState) -> Dict:
         Dictionary with updated state fields
     """
     try:
-        model = ChatOpenAI(model="gpt-4o-mini")
         # Get the messages from the state
         messages = state.messages
         
@@ -98,17 +202,13 @@ def call_model(state: AICodeAuditState) -> Dict:
         You're experienced ai code auditor. Always provide technical insights and recommendations - be the best possible mentor for the developer. Answer the user's question based on the repo code, prepared report and the messages:
         """
         
-        try:
-            # Call the model
-            response = model.invoke(prompt)
-            
-            # Return only updated fields
-            return {"messages": [response]}
-        except Exception as e:
-            return {
-                "errors": state.errors + [{"source": "call_model", "message": f"Error calling language model: {str(e)}"}],
-                "messages": [AIMessage(content=f"Error answering your question: {str(e)}")]
-            }
+        return call_llm_with_error_handling(
+            prompt=prompt,
+            state=state,
+            source="call_model",
+            success_message="",  # Empty because we'll use the model's response directly
+            model_name="gpt-4o-mini"
+        )
             
     except Exception as e:
         # Catch any other unexpected exceptions
@@ -118,7 +218,7 @@ def call_model(state: AICodeAuditState) -> Dict:
         }
 
 
-def fetch_github_repo_node(state: AICodeAuditState) -> Dict:
+def fetch_github_repo_node(state: AICodeAuditState) -> StateUpdate:
     """
     Fetches a GitHub repository, extracts its structure and file contents.
     
@@ -233,7 +333,7 @@ def _is_binary_path(path):
     return any(path.lower().endswith(ext) for ext in binary_extensions)
 
 
-def architectural_perspective_node(state: AICodeAuditState) -> Dict:
+def architectural_perspective_node(state: AICodeAuditState) -> StateUpdate:
     """
     Analyzes repository from an architectural perspective.
     
@@ -243,69 +343,43 @@ def architectural_perspective_node(state: AICodeAuditState) -> Dict:
     Returns:
         Dictionary with updated state fields
     """
-    try:
-        # Get the repo content from the state
-        repo_content = state.repo_content if hasattr(state, "repo_content") and state.repo_content else ""
-        
-        if not repo_content:
-            return {
-                "errors": state.errors + [{"source": "architectural_perspective", "message": "Repository content not available"}],
-                "messages": [AIMessage(content="Error: Repository content not available for architectural analysis. Please fetch the repository first.")]
-            }
-        
-        model = ChatOpenAI(model="gpt-4o-mini")
-        
-        prompt = f"""
-        # Architectural Code Review
+    prompt_template = """
+    # Architectural Code Review
 
-        Below is the code repository content. Please analyze it from an ARCHITECTURAL perspective.
+    Below is the code repository content. Please analyze it from an ARCHITECTURAL perspective.
 
-        Focus on:
-        - Overall architecture patterns and design
-        - Component organization and modularity
-        - Dependencies between modules
-        - Architectural strengths and weaknesses
-        - Scalability concerns
-        - Potential architectural improvements
+    Focus on:
+    - Overall architecture patterns and design
+    - Component organization and modularity
+    - Dependencies between modules
+    - Architectural strengths and weaknesses
+    - Scalability concerns
+    - Potential architectural improvements
 
-        Format your response as a professional Markdown report with the following sections:
-        1. Executive Summary
-        2. Architecture Overview (with diagrams descriptions if possible)
-        3. Component Analysis
-        4. Dependencies Assessment
-        5. Architectural Strengths
-        6. Architectural Weaknesses
-        7. Scalability Evaluation
-        8. Recommendations for Improvement
+    Format your response as a professional Markdown report with the following sections:
+    1. Executive Summary
+    2. Architecture Overview (with diagrams descriptions if possible)
+    3. Component Analysis
+    4. Dependencies Assessment
+    5. Architectural Strengths
+    6. Architectural Weaknesses
+    7. Scalability Evaluation
+    8. Recommendations for Improvement
 
-        REPOSITORY CONTENT:
-        {repo_content}
-        """
-        
-        try:
-            # Call the model
-            response = model.invoke(prompt)
-            
-            # Return only updated fields
-            return {
-                "messages": [AIMessage(content="Architectural perspective report generated successfully")],
-                "architectural_report": response.content
-            }
-        except Exception as e:
-            return {
-                "errors": state.errors + [{"source": "architectural_perspective", "message": f"Error calling language model: {str(e)}"}],
-                "messages": [AIMessage(content=f"Error generating architectural report: {str(e)}")]
-            }
-            
-    except Exception as e:
-        # Catch any other unexpected exceptions
-        return {
-            "errors": state.errors + [{"source": "architectural_perspective", "message": f"Unexpected error: {str(e)}"}],
-            "messages": [AIMessage(content=f"An unexpected error occurred during architectural analysis: {str(e)}")]
-        }
+    REPOSITORY CONTENT:
+    {repo_content}
+    """
+    
+    return handle_perspective_analysis(
+        state=state,
+        perspective="architectural",
+        prompt_template=prompt_template,
+        result_field="architectural_report",
+        success_message="Architectural perspective report generated successfully"
+    )
 
 
-def business_domain_perspective_node(state: AICodeAuditState) -> Dict:
+def business_domain_perspective_node(state: AICodeAuditState) -> StateUpdate:
     """
     Analyzes repository from a business/domain perspective.
     
@@ -315,70 +389,44 @@ def business_domain_perspective_node(state: AICodeAuditState) -> Dict:
     Returns:
         Dictionary with updated state fields
     """
-    try:
-        # Get the repo content from the state
-        repo_content = state.repo_content if hasattr(state, "repo_content") and state.repo_content else ""
-        
-        if not repo_content:
-            return {
-                "errors": state.errors + [{"source": "business_domain_perspective", "message": "Repository content not available"}],
-                "messages": [AIMessage(content="Error: Repository content not available for business/domain analysis. Please fetch the repository first.")]
-            }
-        
-        model = ChatOpenAI(model="gpt-4o-mini")
-        
-        prompt = f"""
-        # Business/Domain Code Review
+    prompt_template = """
+    # Business/Domain Code Review
 
-        Below is the code repository content. Please analyze it from a BUSINESS/DOMAIN perspective.
+    Below is the code repository content. Please analyze it from a BUSINESS/DOMAIN perspective.
 
-        Focus on:
-        - Alignment with business requirements
-        - Domain model clarity
-        - Business rules implementation
-        - Domain language usage in code
-        - Coverage of business functions
-        - Business value delivery
-        - Missing business functionality
+    Focus on:
+    - Alignment with business requirements
+    - Domain model clarity
+    - Business rules implementation
+    - Domain language usage in code
+    - Coverage of business functions
+    - Business value delivery
+    - Missing business functionality
 
-        Format your response as a professional Markdown report with the following sections:
-        1. Executive Summary
-        2. Domain Model Assessment
-        3. Business Logic Evaluation
-        4. Domain Language Analysis
-        5. Functional Coverage
-        6. Business Value Alignment
-        7. Gaps and Missing Functionality
-        8. Recommendations for Business Alignment
+    Format your response as a professional Markdown report with the following sections:
+    1. Executive Summary
+    2. Domain Model Assessment
+    3. Business Logic Evaluation
+    4. Domain Language Analysis
+    5. Functional Coverage
+    6. Business Value Alignment
+    7. Gaps and Missing Functionality
+    8. Recommendations for Business Alignment
 
-        REPOSITORY CONTENT:
-        {repo_content}
-        """
-        
-        try:
-            # Call the model
-            response = model.invoke(prompt)
-            
-            # Return only updated fields
-            return {
-                "messages": [AIMessage(content="Business/Domain perspective report generated successfully")],
-                "business_domain_report": response.content
-            }
-        except Exception as e:
-            return {
-                "errors": state.errors + [{"source": "business_domain_perspective", "message": f"Error calling language model: {str(e)}"}],
-                "messages": [AIMessage(content=f"Error generating business/domain report: {str(e)}")]
-            }
-            
-    except Exception as e:
-        # Catch any other unexpected exceptions
-        return {
-            "errors": state.errors + [{"source": "business_domain_perspective", "message": f"Unexpected error: {str(e)}"}],
-            "messages": [AIMessage(content=f"An unexpected error occurred during business/domain analysis: {str(e)}")]
-        }
+    REPOSITORY CONTENT:
+    {repo_content}
+    """
+    
+    return handle_perspective_analysis(
+        state=state,
+        perspective="business_domain",
+        prompt_template=prompt_template,
+        result_field="business_domain_report",
+        success_message="Business/Domain perspective report generated successfully"
+    )
 
 
-def code_quality_perspective_node(state: AICodeAuditState) -> Dict:
+def code_quality_perspective_node(state: AICodeAuditState) -> StateUpdate:
     """
     Analyzes repository from a code quality perspective.
     
@@ -388,71 +436,45 @@ def code_quality_perspective_node(state: AICodeAuditState) -> Dict:
     Returns:
         Dictionary with updated state fields
     """
-    try:
-        # Get the repo content from the state
-        repo_content = state.repo_content if hasattr(state, "repo_content") and state.repo_content else ""
-        
-        if not repo_content:
-            return {
-                "errors": state.errors + [{"source": "code_quality_perspective", "message": "Repository content not available"}],
-                "messages": [AIMessage(content="Error: Repository content not available for code quality analysis. Please fetch the repository first.")]
-            }
-        
-        model = ChatOpenAI(model="gpt-4o-mini")
-        
-        prompt = f"""
-        # Code Quality Review
+    prompt_template = """
+    # Code Quality Review
 
-        Below is the code repository content. Please analyze it from a CODE QUALITY perspective.
+    Below is the code repository content. Please analyze it from a CODE QUALITY perspective.
 
-        Focus on:
-        - Clean code principles (SOLID, DRY, KISS)
-        - Code smells and anti-patterns
-        - Code complexity and readability
-        - Naming conventions and consistency
-        - Error handling and edge cases
-        - Testing quality and coverage
-        - Documentation and comments
+    Focus on:
+    - Clean code principles (SOLID, DRY, KISS)
+    - Code smells and anti-patterns
+    - Code complexity and readability
+    - Naming conventions and consistency
+    - Error handling and edge cases
+    - Testing quality and coverage
+    - Documentation and comments
 
-        Format your response as a professional Markdown report with the following sections:
-        1. Executive Summary
-        2. Clean Code Assessment
-        3. Code Smells and Anti-patterns
-        4. Complexity Analysis
-        5. Readability Evaluation
-        6. Error Handling Review
-        7. Testing Evaluation
-        8. Documentation Assessment
-        9. Recommendations for Improvement
+    Format your response as a professional Markdown report with the following sections:
+    1. Executive Summary
+    2. Clean Code Assessment
+    3. Code Smells and Anti-patterns
+    4. Complexity Analysis
+    5. Readability Evaluation
+    6. Error Handling Review
+    7. Testing Evaluation
+    8. Documentation Assessment
+    9. Recommendations for Improvement
 
-        REPOSITORY CONTENT:
-        {repo_content}
-        """
-        
-        try:
-            # Call the model
-            response = model.invoke(prompt)
-            
-            # Return only updated fields
-            return {
-                "messages": [AIMessage(content="Code quality perspective report generated successfully")],
-                "code_quality_report": response.content
-            }
-        except Exception as e:
-            return {
-                "errors": state.errors + [{"source": "code_quality_perspective", "message": f"Error calling language model: {str(e)}"}],
-                "messages": [AIMessage(content=f"Error generating code quality report: {str(e)}")]
-            }
-            
-    except Exception as e:
-        # Catch any other unexpected exceptions
-        return {
-            "errors": state.errors + [{"source": "code_quality_perspective", "message": f"Unexpected error: {str(e)}"}],
-            "messages": [AIMessage(content=f"An unexpected error occurred during code quality analysis: {str(e)}")]
-        }
+    REPOSITORY CONTENT:
+    {repo_content}
+    """
+    
+    return handle_perspective_analysis(
+        state=state,
+        perspective="code_quality",
+        prompt_template=prompt_template,
+        result_field="code_quality_report",
+        success_message="Code quality perspective report generated successfully"
+    )
 
 
-def security_perspective_node(state: AICodeAuditState) -> Dict:
+def security_perspective_node(state: AICodeAuditState) -> StateUpdate:
     """
     Analyzes repository from a security perspective.
     
@@ -462,71 +484,45 @@ def security_perspective_node(state: AICodeAuditState) -> Dict:
     Returns:
         Dictionary with updated state fields
     """
-    try:
-        # Get the repo content from the state
-        repo_content = state.repo_content if hasattr(state, "repo_content") and state.repo_content else ""
-        
-        if not repo_content:
-            return {
-                "errors": state.errors + [{"source": "security_perspective", "message": "Repository content not available"}],
-                "messages": [AIMessage(content="Error: Repository content not available for security analysis. Please fetch the repository first.")]
-            }
-        
-        model = ChatOpenAI(model="gpt-4o-mini")
-        
-        prompt = f"""
-        # Security Code Review
+    prompt_template = """
+    # Security Code Review
 
-        Below is the code repository content. Please analyze it from a SECURITY perspective.
+    Below is the code repository content. Please analyze it from a SECURITY perspective.
 
-        Focus on:
-        - Common security vulnerabilities (OWASP Top 10 if applicable)
-        - Authentication and authorization mechanisms
-        - Data validation and sanitization
-        - Secure coding practices
-        - Sensitive data handling
-        - Cryptography usage
-        - Security configurations
+    Focus on:
+    - Common security vulnerabilities (OWASP Top 10 if applicable)
+    - Authentication and authorization mechanisms
+    - Data validation and sanitization
+    - Secure coding practices
+    - Sensitive data handling
+    - Cryptography usage
+    - Security configurations
 
-        Format your response as a professional Markdown report with the following sections:
-        1. Executive Summary
-        2. Vulnerability Assessment
-        3. Authentication & Authorization Review
-        4. Data Validation Analysis
-        5. Sensitive Data Handling
-        6. Cryptography Evaluation
-        7. Security Configuration Review
-        8. Risk Assessment
-        9. Security Recommendations
+    Format your response as a professional Markdown report with the following sections:
+    1. Executive Summary
+    2. Vulnerability Assessment
+    3. Authentication & Authorization Review
+    4. Data Validation Analysis
+    5. Sensitive Data Handling
+    6. Cryptography Evaluation
+    7. Security Configuration Review
+    8. Risk Assessment
+    9. Security Recommendations
 
-        REPOSITORY CONTENT:
-        {repo_content}
-        """
-        
-        try:
-            # Call the model
-            response = model.invoke(prompt)
-            
-            # Return only updated fields
-            return {
-                "messages": [AIMessage(content="Security perspective report generated successfully")],
-                "security_report": response.content
-            }
-        except Exception as e:
-            return {
-                "errors": state.errors + [{"source": "security_perspective", "message": f"Error calling language model: {str(e)}"}],
-                "messages": [AIMessage(content=f"Error generating security report: {str(e)}")]
-            }
-            
-    except Exception as e:
-        # Catch any other unexpected exceptions
-        return {
-            "errors": state.errors + [{"source": "security_perspective", "message": f"Unexpected error: {str(e)}"}],
-            "messages": [AIMessage(content=f"An unexpected error occurred during security analysis: {str(e)}")]
-        }
+    REPOSITORY CONTENT:
+    {repo_content}
+    """
+    
+    return handle_perspective_analysis(
+        state=state,
+        perspective="security",
+        prompt_template=prompt_template,
+        result_field="security_report",
+        success_message="Security perspective report generated successfully"
+    )
 
 
-def modernization_perspective_node(state: AICodeAuditState) -> Dict:
+def modernization_perspective_node(state: AICodeAuditState) -> StateUpdate:
     """
     Analyzes repository from a modernization perspective.
     
@@ -536,69 +532,43 @@ def modernization_perspective_node(state: AICodeAuditState) -> Dict:
     Returns:
         Dictionary with updated state fields
     """
-    try:
-        # Get the repo content from the state
-        repo_content = state.repo_content if hasattr(state, "repo_content") and state.repo_content else ""
-        
-        if not repo_content:
-            return {
-                "errors": state.errors + [{"source": "modernization_perspective", "message": "Repository content not available"}],
-                "messages": [AIMessage(content="Error: Repository content not available for modernization analysis. Please fetch the repository first.")]
-            }
-        
-        model = ChatOpenAI(model="gpt-4o-mini")
-        
-        prompt = f"""
-        # Modernization Code Review
+    prompt_template = """
+    # Modernization Code Review
 
-        Below is the code repository content. Please analyze it from a MODERNIZATION perspective.
+    Below is the code repository content. Please analyze it from a MODERNIZATION perspective.
 
-        Focus on:
-        - Outdated technologies, frameworks, and libraries
-        - Legacy code patterns and approaches
-        - Technical debt
-        - Modern alternatives for current implementations
-        - Opportunities for adopting new technologies
-        - Migration paths and strategies
-        - Potential performance improvements with modern approaches
+    Focus on:
+    - Outdated technologies, frameworks, and libraries
+    - Legacy code patterns and approaches
+    - Technical debt
+    - Modern alternatives for current implementations
+    - Opportunities for adopting new technologies
+    - Migration paths and strategies
+    - Potential performance improvements with modern approaches
 
-        Format your response as a professional Markdown report with the following sections:
-        1. Executive Summary
-        2. Technology Stack Assessment
-        3. Legacy Code Evaluation
-        4. Technical Debt Analysis
-        5. Modernization Opportunities
-        6. Suggested Technologies and Approaches
-        7. Migration Strategy
-        8. Performance Improvement Potential
+    Format your response as a professional Markdown report with the following sections:
+    1. Executive Summary
+    2. Technology Stack Assessment
+    3. Legacy Code Evaluation
+    4. Technical Debt Analysis
+    5. Modernization Opportunities
+    6. Suggested Technologies and Approaches
+    7. Migration Strategy
+    8. Performance Improvement Potential
 
-        REPOSITORY CONTENT:
-        {repo_content}
-        """
-        
-        try:
-            # Call the model
-            response = model.invoke(prompt)
-            
-            # Return only updated fields
-            return {
-                "messages": [AIMessage(content="Modernization perspective report generated successfully")],
-                "modernization_report": response.content
-            }
-        except Exception as e:
-            return {
-                "errors": state.errors + [{"source": "modernization_perspective", "message": f"Error calling language model: {str(e)}"}],
-                "messages": [AIMessage(content=f"Error generating modernization report: {str(e)}")]
-            }
-            
-    except Exception as e:
-        # Catch any other unexpected exceptions
-        return {
-            "errors": state.errors + [{"source": "modernization_perspective", "message": f"Unexpected error: {str(e)}"}],
-            "messages": [AIMessage(content=f"An unexpected error occurred during modernization analysis: {str(e)}")]
-        }
+    REPOSITORY CONTENT:
+    {repo_content}
+    """
+    
+    return handle_perspective_analysis(
+        state=state,
+        perspective="modernization",
+        prompt_template=prompt_template,
+        result_field="modernization_report",
+        success_message="Modernization perspective report generated successfully"
+    )
 
-def generate_report_node(state: AICodeAuditState) -> Dict:
+def generate_report_node(state: AICodeAuditState) -> StateUpdate:
     """
     Generates a comprehensive report from all perspectives.
     
@@ -651,21 +621,14 @@ def generate_report_node(state: AICodeAuditState) -> Dict:
         Please generate a comprehensive report by combining all the perspectives.
         """
         
-        try:
-            model = ChatOpenAI(model="gpt-4o-mini")
-            # Call the model
-            response = model.invoke(prompt)
-            
-            # Return only updated fields
-            return {
-                "messages": [AIMessage(content="Comprehensive report generated successfully")],
-                "report": response.content
-            }
-        except Exception as e:
-            return {
-                "errors": state.errors + [{"source": "generate_report", "message": f"Error calling language model: {str(e)}"}],
-                "messages": [AIMessage(content=f"Error generating comprehensive report: {str(e)}")]
-            }
+        return call_llm_with_error_handling(
+            prompt=prompt,
+            state=state,
+            source="generate_report",
+            success_message="Comprehensive report generated successfully",
+            result_field="report",
+            model_name="gpt-4o-mini"
+        )
             
     except Exception as e:
         # Catch any other unexpected exceptions
