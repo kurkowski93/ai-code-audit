@@ -2,7 +2,7 @@
 Agent graph implementation.
 """
 from langgraph.graph import StateGraph, END, START
-from my_agent.utils.nodes import call_model, fetch_github_repo_node, architectural_perspective_node, business_domain_perspective_node, code_quality_perspective_node, security_perspective_node, modernization_perspective_node, generate_report_node, starting_node, AgentAction
+from my_agent.utils.nodes import answer_question, fetch_github_repo_node, architectural_perspective_node, business_domain_perspective_node, code_quality_perspective_node, security_perspective_node, modernization_perspective_node, generate_report_node, starting_node, AgentAction
 from my_agent.utils.state import AICodeAuditState
 
 
@@ -12,7 +12,7 @@ workflow = StateGraph(AICodeAuditState)
 
 # Add nodes
 workflow.add_node("starting_node", starting_node)
-workflow.add_node("answer_question", call_model)
+workflow.add_node("answer_question", answer_question)
 workflow.add_node("fetch_repo", fetch_github_repo_node)
 workflow.add_node("architectural_perspective", architectural_perspective_node)
 workflow.add_node("business_domain_perspective", business_domain_perspective_node)

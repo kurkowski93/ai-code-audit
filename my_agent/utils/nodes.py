@@ -5,6 +5,7 @@ import re
 import os
 import base64
 import requests
+import fnmatch
 from typing import Dict, List, Optional, Any, Callable, TypeVar, Union, Tuple
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_openai import ChatOpenAI
@@ -18,6 +19,70 @@ from pydantic import BaseModel, Field
 StateUpdate = Dict[str, Any]
 ErrorInfo = Dict[str, str]
 T = TypeVar('T')
+
+# Default patterns for file filtering
+DEFAULT_EXCLUDE_PATTERNS = [
+    "**/node_modules/**",
+    "**/.git/**",
+    "**/venv/**",
+    "**/__pycache__/**",
+    "**/.idea/**",
+    "**/.vscode/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/.DS_Store",
+    "**/*.min.js",
+    "**/*.min.css",
+    "**/vendor/**",
+    "**/third_party/**",
+    "**/*.pyc",
+    "**/*.pyo",
+    "**/*.so",
+    "**/*.o",
+    "**/*.a",
+    "**/*.dll",
+    "**/*.exe",
+    "**/*.bin",
+    "**/*.jar",
+    "**/*.war",
+    "**/*.ear",
+    "**/*.zip",
+    "**/*.tar",
+    "**/*.gz",
+    "**/*.rar",
+    "**/*.7z"
+]
+
+def should_include_file(file_path: str, exclude_patterns: List[str] = DEFAULT_EXCLUDE_PATTERNS) -> bool:
+    """
+    Determine if a file should be included in the analysis.
+    
+    Args:
+        file_path: Path to the file
+        exclude_patterns: List of glob patterns for files to exclude
+        
+    Returns:
+        True if the file should be included, False otherwise
+    """
+    # Check exclude patterns
+    for pattern in exclude_patterns:
+        if fnmatch.fnmatch(file_path, pattern):
+            return False
+    
+    return True
+
+def estimate_tokens(text: str) -> int:
+    """
+    Estimate the number of tokens in a text using a simple heuristic.
+    
+    Args:
+        text: The text to estimate tokens for
+        
+    Returns:
+        Estimated number of tokens
+    """
+    # Simple heuristic: approximately 4 characters per token for English text
+    return len(text) // 4
 
 class AgentAction(str, Enum):
     """Possible actions that the agent can take."""
@@ -35,9 +100,7 @@ def check_repo_content(state: AICodeAuditState, perspective: str) -> Optional[St
     Returns:
         StateUpdate if there's an error, None if content is available
     """
-    repo_content = state.repo_content if hasattr(state, "repo_content") and state.repo_content else ""
-    
-    if not repo_content:
+    if not hasattr(state, "repo_content") or not state.repo_content or len(state.repo_content) == 0:
         return {
             "errors": state.errors + [{"source": f"{perspective}_perspective", "message": "Repository content not available"}],
             "messages": [AIMessage(content=f"Error: Repository content not available for {perspective} analysis. Please fetch the repository first.")]
@@ -71,7 +134,13 @@ def call_llm_with_error_handling(
         model = ChatOpenAI(model=model_name)
         response = model.invoke(prompt)
         
-        result = {"messages": [AIMessage(content=response.content)]}
+        # If success_message is empty, use the model's response directly
+        if success_message:
+            result = {"messages": [AIMessage(content=success_message)]}
+        else:
+            result = {"messages": [AIMessage(content=response.content)]}
+            
+        # If result_field is provided, store the response content
         if result_field:
             result[result_field] = response.content
         
@@ -87,16 +156,19 @@ def handle_perspective_analysis(
     perspective: str,
     prompt_template: str,
     result_field: str,
+    partial_reports_field: str,
     success_message: str
 ) -> StateUpdate:
     """
-    Handle the analysis of a repository from a specific perspective.
+    Handle the analysis of a repository from a specific perspective by processing all chunks
+    and combining the results in a single operation.
     
     Args:
         state: The current state
         perspective: The name of the perspective
         prompt_template: The template for the prompt to send to the model
-        result_field: The field to store the result in
+        result_field: The field to store the final result in
+        partial_reports_field: The field to store partial reports in
         success_message: The message to return on success
         
     Returns:
@@ -108,20 +180,79 @@ def handle_perspective_analysis(
         if content_check:
             return content_check
         
-        # Format the prompt with the repository content
-        prompt = prompt_template.format(repo_content=state.repo_content)
+        # Process all chunks in parallel and collect partial reports
+        partial_reports = []
         
-        # Call the model with error handling
-        return call_llm_with_error_handling(
-            prompt=prompt,
-            state=state,
-            source=f"{perspective}_perspective",
-            success_message=success_message,
-            result_field=result_field
-        )
+        # Process each chunk
+        for i, chunk in enumerate(state.repo_content):
+            # Format the prompt with the current chunk
+            chunk_prompt = f"""
+            # {perspective.capitalize()} Analysis - Chunk {i + 1} of {len(state.repo_content)}
+            
+            {prompt_template}
+            
+            REPOSITORY STRUCTURE:
+            {state.repo_structure if hasattr(state, "repo_structure") else "Structure not available"}
+            
+            CONTENT CHUNK {i + 1}:
+            {chunk}
+            
+            Note: This is chunk {i + 1} of {len(state.repo_content)}. Focus on analyzing what you can see in this chunk.
+            """
+            
+            # Call the model to analyze the current chunk
+            try:
+                model = ChatOpenAI(model="gpt-4o-mini")
+                response = model.invoke(chunk_prompt)
+                partial_reports.append(response.content)
+            except Exception as e:
+                return {
+                    "errors": state.errors + [{"source": perspective, "message": f"Error analyzing chunk {i + 1}: {str(e)}"}],
+                    "messages": [AIMessage(content=f"Error analyzing chunk {i + 1} for {perspective} perspective: {str(e)}")]
+                }
+        
+        # Combine the partial reports
+        # Przygotuj sformatowane częściowe raporty
+        formatted_reports = ""
+        for i, report in enumerate(partial_reports):
+            formatted_reports += f"--- CHUNK {i+1} ---\n{report}\n\n"
+            
+        combine_prompt = f"""
+        # Combining {perspective.capitalize()} Analysis Reports
+        
+        Below are partial analysis reports for different chunks of a repository.
+        Please combine them into a coherent, comprehensive report, removing any redundancies.
+        
+        REPOSITORY STRUCTURE:
+        {state.repo_structure if hasattr(state, "repo_structure") else "Structure not available"}
+        
+        PARTIAL REPORTS:
+        {formatted_reports}
+        
+        Please provide a comprehensive {perspective} report that combines all the insights from the partial reports.
+        """
+        
+        # Call the model to combine the reports
+        try:
+            model = ChatOpenAI(model="gpt-4o-mini")
+            combined_response = model.invoke(combine_prompt)
+            
+            # Return the combined report
+            return {
+                "messages": [AIMessage(content=success_message)],
+                result_field: combined_response.content,
+                partial_reports_field: partial_reports  # Store the partial reports for reference
+            }
+        except Exception as e:
+            return {
+                "errors": state.errors + [{"source": perspective, "message": f"Error combining reports: {str(e)}"}],
+                "messages": [AIMessage(content=f"Error combining {perspective} reports: {str(e)}")]
+            }
+            
     except Exception as e:
+        # Catch any other unexpected exceptions
         return {
-            "errors": state.errors + [{"source": f"{perspective}_perspective", "message": f"Unexpected error: {str(e)}"}],
+            "errors": state.errors + [{"source": perspective, "message": f"Unexpected error: {str(e)}"}],
             "messages": [AIMessage(content=f"An unexpected error occurred during {perspective} analysis: {str(e)}")]
         }
 
@@ -174,7 +305,7 @@ def starting_node(state: AICodeAuditState) -> StateUpdate:
         }
 
 
-def call_model(state: AICodeAuditState) -> StateUpdate:
+def answer_question(state: AICodeAuditState) -> StateUpdate:
     """
     Call the LLM with the current messages.
     
@@ -205,7 +336,7 @@ def call_model(state: AICodeAuditState) -> StateUpdate:
         return call_llm_with_error_handling(
             prompt=prompt,
             state=state,
-            source="call_model",
+            source="answer_question",
             success_message="",  # Empty because we'll use the model's response directly
             model_name="gpt-4o-mini"
         )
@@ -213,17 +344,19 @@ def call_model(state: AICodeAuditState) -> StateUpdate:
     except Exception as e:
         # Catch any other unexpected exceptions
         return {
-            "errors": state.errors + [{"source": "call_model", "message": f"Unexpected error: {str(e)}"}],
+            "errors": state.errors + [{"source": "answer_question", "message": f"Unexpected error: {str(e)}"}],
             "messages": [AIMessage(content=f"An unexpected error occurred while answering your question: {str(e)}")]
         }
 
 
-def fetch_github_repo_node(state: AICodeAuditState) -> StateUpdate:
+def fetch_github_repo_node(state: AICodeAuditState, max_tokens_per_chunk: int = 50000) -> StateUpdate:
     """
     Fetches a GitHub repository, extracts its structure and file contents.
+    Filters out unnecessary files and creates content chunks that fit within token limits.
     
     Args:
         state: The current state containing repository URL and GitHub token
+        max_tokens_per_chunk: Maximum number of tokens per chunk
         
     Returns:
         Dictionary with updated state fields
@@ -282,6 +415,10 @@ def fetch_github_repo_node(state: AICodeAuditState) -> StateUpdate:
                     # Get contents of this directory
                     contents.extend(repo.get_contents(file_content.path))
                 else:
+                    # Check if file should be included
+                    if not should_include_file(file_content.path):
+                        continue
+                        
                     # Add file to structure
                     repo_structure.append(f"📄 {file_content.path}")
                     
@@ -299,16 +436,64 @@ def fetch_github_repo_node(state: AICodeAuditState) -> StateUpdate:
                         file_data = f"\n{'='*80}\nFILE: {file_content.path}\n{'='*80}\n[Could not decode file content]\n"
                         file_contents.append(file_data)
             
-            # Combine structure and contents
+            # Create structure string
             structure_str = "REPOSITORY STRUCTURE:\n" + "\n".join(repo_structure)
-            content_str = "\n\nFILE CONTENTS:" + "".join(file_contents)
             
-            repo_data = structure_str + content_str
+            # Create content chunks
+            content_chunks = []
+            current_chunk = ""
+            current_tokens = 0
+            
+            for file_content in file_contents:
+                file_tokens = estimate_tokens(file_content)
+                
+                # If this file alone exceeds the token limit, we need to split it
+                if file_tokens > max_tokens_per_chunk:
+                    # Add the current chunk if it's not empty
+                    if current_chunk:
+                        content_chunks.append(current_chunk)
+                        current_chunk = ""
+                        current_tokens = 0
+                    
+                    # Split the file into smaller chunks
+                    file_lines = file_content.split('\n')
+                    sub_chunk = ""
+                    sub_tokens = 0
+                    
+                    for line in file_lines:
+                        line_tokens = estimate_tokens(line + '\n')
+                        if sub_tokens + line_tokens > max_tokens_per_chunk:
+                            # Add the sub-chunk and start a new one
+                            content_chunks.append(sub_chunk)
+                            sub_chunk = line + '\n'
+                            sub_tokens = line_tokens
+                        else:
+                            sub_chunk += line + '\n'
+                            sub_tokens += line_tokens
+                    
+                    # Add the last sub-chunk if it's not empty
+                    if sub_chunk:
+                        content_chunks.append(sub_chunk)
+                else:
+                    # If adding this file would exceed the token limit, start a new chunk
+                    if current_tokens + file_tokens > max_tokens_per_chunk:
+                        content_chunks.append(current_chunk)
+                        current_chunk = file_content
+                        current_tokens = file_tokens
+                    else:
+                        # Add the file to the current chunk
+                        current_chunk += file_content
+                        current_tokens += file_tokens
+            
+            # Add the last chunk if it's not empty
+            if current_chunk:
+                content_chunks.append(current_chunk)
             
             # Return only updated fields
             return {
-                "messages": [AIMessage(content=f"Successfully fetched repository: {owner}/{repo_name}")],
-                "repo_content": repo_data
+                "messages": [AIMessage(content=f"Successfully fetched repository: {owner}/{repo_name}. Created {len(content_chunks)} content chunks.")],
+                "repo_structure": structure_str,
+                "repo_content": content_chunks
             }
         except GithubException as e:
             return {
@@ -375,6 +560,7 @@ def architectural_perspective_node(state: AICodeAuditState) -> StateUpdate:
         perspective="architectural",
         prompt_template=prompt_template,
         result_field="architectural_report",
+        partial_reports_field="architectural_partial_reports",
         success_message="Architectural perspective report generated successfully"
     )
 
@@ -422,6 +608,7 @@ def business_domain_perspective_node(state: AICodeAuditState) -> StateUpdate:
         perspective="business_domain",
         prompt_template=prompt_template,
         result_field="business_domain_report",
+        partial_reports_field="business_domain_partial_reports",
         success_message="Business/Domain perspective report generated successfully"
     )
 
@@ -470,6 +657,7 @@ def code_quality_perspective_node(state: AICodeAuditState) -> StateUpdate:
         perspective="code_quality",
         prompt_template=prompt_template,
         result_field="code_quality_report",
+        partial_reports_field="code_quality_partial_reports",
         success_message="Code quality perspective report generated successfully"
     )
 
@@ -518,6 +706,7 @@ def security_perspective_node(state: AICodeAuditState) -> StateUpdate:
         perspective="security",
         prompt_template=prompt_template,
         result_field="security_report",
+        partial_reports_field="security_partial_reports",
         success_message="Security perspective report generated successfully"
     )
 
@@ -565,6 +754,7 @@ def modernization_perspective_node(state: AICodeAuditState) -> StateUpdate:
         perspective="modernization",
         prompt_template=prompt_template,
         result_field="modernization_report",
+        partial_reports_field="modernization_partial_reports",
         success_message="Modernization perspective report generated successfully"
     )
 
