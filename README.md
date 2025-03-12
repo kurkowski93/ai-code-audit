@@ -78,11 +78,15 @@ After a repository has been analyzed, you can ask questions about it:
 ## Project Structure
 
 - `my_agent/`: Main agent code
-  - `agent.py`: LangGraph workflow definition
+  - `agent.py`: LangGraph workflow definition and core agent logic
+  - `requirements.txt`: Additional dependencies specific to the agent
   - `utils/`: Utility functions and components
-    - `nodes.py`: Node functions for the graph
-    - `state.py`: State definitions
-    - `tools.py`: Tools for the agent
+    - `nodes.py`: Node functions for the graph, including perspective analysis implementations
+    - `state.py`: State management and data structures
+    - `tools.py`: Custom tools and utilities for the agent
+- `langgraph.json`: LangGraph configuration file
+- `requirements.txt`: Main project dependencies
+- `.env`: Environment variables configuration
 
 ## Contributing
 

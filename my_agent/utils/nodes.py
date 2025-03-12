@@ -86,10 +86,10 @@ def estimate_tokens(text: str) -> int:
 
 class AgentAction(str, Enum):
     """Possible actions that the agent can take."""
-    DOWNLOAD_REPO_AND_MAKE_REPORT = "download_repo_and_make_report",
+    DOWNLOAD_REPO_AND_MAKE_REPORT = "download_repo_and_make_report"
     ANSWER_QUESTION = "answer_question"
 
-def check_repo_content(state: AICodeAuditState, perspective: str) -> Optional[StateUpdate]:
+def validate_repo_content(state: AICodeAuditState, perspective: str) -> Optional[StateUpdate]:
     """
     Check if repository content is available in the state.
     
@@ -98,7 +98,7 @@ def check_repo_content(state: AICodeAuditState, perspective: str) -> Optional[St
         perspective: The name of the perspective checking the content
         
     Returns:
-        StateUpdate if there's an error, None if content is available
+        StateUpdate if there's an error, None otherwise
     """
     if not hasattr(state, "repo_content") or not state.repo_content or len(state.repo_content) == 0:
         return {
@@ -176,7 +176,7 @@ def handle_perspective_analysis(
     """
     try:
         # Check if repository content is available
-        content_check = check_repo_content(state, perspective)
+        content_check = validate_repo_content(state, perspective)
         if content_check:
             return content_check
         
@@ -349,7 +349,7 @@ def answer_question(state: AICodeAuditState) -> StateUpdate:
         }
 
 
-def fetch_github_repo_node(state: AICodeAuditState, max_tokens_per_chunk: int = 50000) -> StateUpdate:
+def fetch_repo_node(state: AICodeAuditState, max_tokens_per_chunk: int = 50000) -> StateUpdate:
     """
     Fetches a GitHub repository, extracts its structure and file contents.
     Filters out unnecessary files and creates content chunks that fit within token limits.
@@ -368,13 +368,13 @@ def fetch_github_repo_node(state: AICodeAuditState, max_tokens_per_chunk: int = 
         
         if not github_token:
             return {
-                "errors": state.errors + [{"source": "fetch_github_repo", "message": "GitHub token not provided in environment variables"}],
+                "errors": state.errors + [{"source": "fetch_repo", "message": "GitHub token not provided in environment variables"}],
                 "messages": [AIMessage(content="Error: GitHub token not provided. Please check your environment variables.")]
             }
         
         if not repo_url:
             return {
-                "errors": state.errors + [{"source": "fetch_github_repo", "message": "Repository URL not provided in state"}],
+                "errors": state.errors + [{"source": "fetch_repo", "message": "Repository URL not provided in state"}],
                 "messages": [AIMessage(content="Error: Repository URL not provided. Please provide a valid GitHub repository URL.")]
             }
         
@@ -383,7 +383,7 @@ def fetch_github_repo_node(state: AICodeAuditState, max_tokens_per_chunk: int = 
         match = re.search(r"github.com/([^/]+)/([^/]+)", repo_url)
         if not match:
             return {
-                "errors": state.errors + [{"source": "fetch_github_repo", "message": f"Invalid GitHub repository URL: {repo_url}"}],
+                "errors": state.errors + [{"source": "fetch_repo", "message": f"Invalid GitHub repository URL: {repo_url}"}],
                 "messages": [AIMessage(content=f"Error: Invalid GitHub repository URL: {repo_url}. Please provide a valid URL in the format https://github.com/owner/repo.")]
             }
         
@@ -396,7 +396,7 @@ def fetch_github_repo_node(state: AICodeAuditState, max_tokens_per_chunk: int = 
             repo = g.get_repo(f"{owner}/{repo_name}")
         except GithubException as e:
             return {
-                "errors": state.errors + [{"source": "fetch_github_repo", "message": f"GitHub API error: {str(e)}"}],
+                "errors": state.errors + [{"source": "fetch_repo", "message": f"GitHub API error: {str(e)}"}],
                 "messages": [AIMessage(content=f"Error accessing repository: {str(e)}. Please check the repository URL and your GitHub token permissions.")]
             }
         
@@ -497,14 +497,14 @@ def fetch_github_repo_node(state: AICodeAuditState, max_tokens_per_chunk: int = 
             }
         except GithubException as e:
             return {
-                "errors": state.errors + [{"source": "fetch_github_repo", "message": f"Error fetching repository contents: {str(e)}"}],
+                "errors": state.errors + [{"source": "fetch_repo", "message": f"Error fetching repository contents: {str(e)}"}],
                 "messages": [AIMessage(content=f"Error fetching repository contents: {str(e)}. The repository might be empty or inaccessible.")]
             }
             
     except Exception as e:
         # Catch any other unexpected exceptions
         return {
-            "errors": state.errors + [{"source": "fetch_github_repo", "message": f"Unexpected error: {str(e)}"}],
+            "errors": state.errors + [{"source": "fetch_repo", "message": f"Unexpected error: {str(e)}"}],
             "messages": [AIMessage(content=f"An unexpected error occurred while fetching the repository: {str(e)}")]
         }
 
